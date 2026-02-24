@@ -433,7 +433,7 @@ function environmentCheckV2(klines, direction, ticker) {
   const tradableCheck = {
     name: 'TRADABLE',
     passed: !ticker || ticker.tradable !== false,
-    value: (ticker && ticker.tradable) ? ticker.tradable : undefined,
+    value: ticker?.tradable,
     severity: 'FAIL'
   };
   checks.push(tradableCheck);
@@ -443,7 +443,7 @@ function environmentCheckV2(klines, direction, ticker) {
   const volumeCheck = {
     name: 'VOLUME',
     passed: !ticker || ticker.volume24h >= CONFIG.ENVIRONMENT.MIN_VOLUME_24H,
-    value: (ticker && ticker.volume24h) ? ticker.volume24h : 0,
+    value: ticker?.volume24h || 0,
     threshold: CONFIG.ENVIRONMENT.MIN_VOLUME_24H,
     severity: 'WARN'
   };
@@ -524,7 +524,7 @@ function environmentCheckV2(klines, direction, ticker) {
       rsi,
       atr: atrPercent,
       volatility,
-      volume24h: (ticker && ticker.volume24h) ? ticker.volume24h : 0,
+      volume24h: ticker?.volume24h || 0,
       currentPrice
     }
   };
@@ -653,7 +653,7 @@ function generateCandidateSignal(symbol, htfBias, ltfConfirm, envCheck, klines, 
   let stopLoss, tp1, tp2;
   
   const atr = calculateATR(klines, 14);
-  const relevantFVG = (ltfConfirm.fvgList && ltfConfirm.fvgList.length > 0) ? ltfConfirm.fvgList[ltfConfirm.fvgList.length - 1] : null;
+  const relevantFVG = ltfConfirm.fvgList?.length > 0 ? ltfConfirm.fvgList[ltfConfirm.fvgList.length - 1] : null;
   
   if (direction === 'LONG') {
     if (relevantFVG && relevantFVG.type === 'BULLISH_FVG') {
@@ -689,14 +689,39 @@ function generateCandidateSignal(symbol, htfBias, ltfConfirm, envCheck, klines, 
   if (htfBias.structureConfirmed) baseScore += 10;
   
   // LTF确认加分
-  const confirmedCount = (ltfConfirm.confirmations && ltfConfirm.confirmations.filter) ? ltfConfirm.confirmations.filter(c => c.detected && c.aligned).length : 0;
+  const confirmedCount = ltfConfirm.confirmations?.filter(c => c.detected && c.aligned).length || 0;
   baseScore += confirmedCount * 5;
   
   // 环境评分加权
   baseScore += (envCheck.environmentScore || 0) * 0.2;
   
-  // 确定信号类型
-  const signalType = ltfConfirm.canEnter ? 'TRADABLE' : 'CANDIDATE';
+  // 确定信号类型 (V2.1: 三档分类)
+  // Type A: 完全确认 (TRADABLE) - 所有关键条件满足
+  // Type B: 部分确认 (PARTIAL) - 环境健康，但缺少1-2个确认条件
+  // Type C: 候选/等待 (CANDIDATE) - 缺少多个确认条件
+  let signalType, entryType, statusDesc;
+  
+  const confirmedCount = ltfConfirm.confirmations.filter(c => c.detected && c.aligned).length;
+  const missingCritical = ltfConfirm.missingConfirmations.filter(m => 
+    ['NO_CHOCH', 'NO_SWEEP', 'NO_FVG'].includes(m)
+  ).length;
+  
+  if (ltfConfirm.canEnter && confirmedCount >= 3 && envCheck.status === 'PASS') {
+    // Type A: 完全确认
+    signalType = 'TRADABLE';
+    entryType = 'A';
+    statusDesc = '等待入场';
+  } else if (envCheck.status !== 'FAIL' && confirmedCount >= 2 && htfBias.structureConfirmed) {
+    // Type B: 部分确认 - 环境健康，有2+确认，结构已确认
+    signalType = 'PARTIAL';
+    entryType = 'B';
+    statusDesc = '部分确认';
+  } else {
+    // Type C: 候选/等待
+    signalType = 'CANDIDATE';
+    entryType = 'C';
+    statusDesc = '等待确认';
+  }
   
   // 确定评级
   let rating = 'C';
@@ -712,26 +737,22 @@ function generateCandidateSignal(symbol, htfBias, ltfConfirm, envCheck, klines, 
   const now = new Date();
   const expiresAt = new Date(now.getTime() + 4 * 60 * 60 * 1000);
   
-    // 计算过期时间（分钟）
+  // 计算过期时间（分钟）
   const expiresInMinutes = Math.round((expiresAt - now) / (60 * 1000));
-  
-  // 确定入场类型
-  const entryType = signalType === 'TRADABLE' ? 'A' : 'C';
-  
-  // 确定状态描述
-  const statusDesc = signalType === 'TRADABLE' ? '等待入场' : '等待确认';
   
   // 生成标签
   const tags = [];
   if (ltfConfirm.choch) tags.push('ChoCH');
-  if (ltfConfirm.fvgList && ltfConfirm.fvgList.length > 0) tags.push('FVG');
+  if (ltfConfirm.fvgList?.length > 0) tags.push('FVG');
   if (ltfConfirm.sweep) tags.push('Sweep');
-  if (ltfConfirm.obs && ltfConfirm.obs.length > 0) tags.push('OB');
+  if (ltfConfirm.obs?.length > 0) tags.push('OB');
+  if (signalType === 'PARTIAL') tags.push('部分确认');
   if (signalType === 'CANDIDATE') tags.push('候选');
   
-  // 获取FVG价格水平
+  // 获取FVG和ChoCH的价格水平
   let fvgTop = 0;
   let fvgBottom = 0;
+  
   if (ltfConfirm.fvgList && ltfConfirm.fvgList.length > 0) {
     const relevantFVG = ltfConfirm.fvgList.find(f => {
       if (direction === 'LONG' && f.type === 'BULLISH_FVG') return true;
@@ -744,42 +765,38 @@ function generateCandidateSignal(symbol, htfBias, ltfConfirm, envCheck, klines, 
     }
   }
   
-  // 获取ChoCH和Sweep价格水平（兼容旧版Node.js）
-  const chochLevel = (ltfConfirm.choch && ltfConfirm.choch.level) ? ltfConfirm.choch.level : 0;
-  const sweepLevel = (ltfConfirm.sweep && ltfConfirm.sweep.sweptLevel) ? ltfConfirm.sweep.sweptLevel : 0;
+  const chochLevel = ltfConfirm.choch?.level || 0;
+  const sweepLevel = ltfConfirm.sweep?.sweptLevel || 0;
   
   return {
-    current_price: currentPrice,
-    entry_type: entryType,
-    status_desc: statusDesc,
-    expires_in_minutes: expiresInMinutes,
-    trigger_time: now.getTime(),
-    kline_time: klines[klines.length - 1].timestamp,
-    data_health: 'HEALTHY',
-    atr,
-    rsi: htfBias.rsi,
-    tags,
-    has_choch: !!ltfConfirm.choch,
-    has_fvg: (ltfConfirm.fvgList && ltfConfirm.fvgList.length > 0),
-    has_sweep: !!ltfConfirm.sweep,
-    fvg_top: fvgTop,
-    fvg_bottom: fvgBottom,
-    choch_level: chochLevel,
-    sweep_level: sweepLevel,
     id: `${symbol}_${Date.now()}`,
     symbol,
     direction,
+    current_price: currentPrice,
     entry_price: entryPrice,
+    entry_type: entryType,
     sl: stopLoss,
     tp1,
     tp2,
     rrr,
     rating,
     score: Math.round(baseScore),
+    atr,
+    rsi: htfBias.rsi,
+    tags,
+    has_choch: !!ltfConfirm.choch,
+    has_fvg: ltfConfirm.fvgList?.length > 0,
+    has_sweep: !!ltfConfirm.sweep,
+    fvg_top: fvgTop,
+    fvg_bottom: fvgBottom,
+    choch_level: chochLevel,
+    sweep_level: sweepLevel,
     
     // V2.0新增字段
-    signal_type: signalType,  // TRADABLE / CANDIDATE
+    signal_type: signalType,
     status: signalType === 'TRADABLE' ? 'ACTIVE' : 'PENDING',
+    status_desc: statusDesc,
+    expires_in_minutes: expiresInMinutes,
     
     // HTF分析
     htf_bias: {
@@ -813,15 +830,18 @@ function generateCandidateSignal(symbol, htfBias, ltfConfirm, envCheck, klines, 
     structure: {
       choch: ltfConfirm.choch,
       sweep: ltfConfirm.sweep,
-      fvg: (ltfConfirm.fvgList && ltfConfirm.fvgList.length > 0) ? ltfConfirm.fvgList[ltfConfirm.fvgList.length - 1] : null,
-      order_blocks: (ltfConfirm.obs && ltfConfirm.obs.slice) ? ltfConfirm.obs.slice(-2) : []
+      fvg: ltfConfirm.fvgList?.[ltfConfirm.fvgList.length - 1] || null,
+      order_blocks: ltfConfirm.obs?.slice(-2) || []
     },
     
     // 时间戳
     timestamp: now.toISOString(),
+    trigger_time: now.getTime(),
+    kline_time: klines[klines.length - 1].timestamp,
     expires_at: expiresAt.toISOString(),
     timeframe: '4H',
-    data_source: 'Gate.io API'
+    data_source: 'Gate.io API',
+    data_health: 'HEALTHY'
   };
 }
 
