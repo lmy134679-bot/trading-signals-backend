@@ -433,7 +433,7 @@ function environmentCheckV2(klines, direction, ticker) {
   const tradableCheck = {
     name: 'TRADABLE',
     passed: !ticker || ticker.tradable !== false,
-    value: ticker?.tradable,
+    value: (ticker && ticker.tradable) ? ticker.tradable : undefined,
     severity: 'FAIL'
   };
   checks.push(tradableCheck);
@@ -443,7 +443,7 @@ function environmentCheckV2(klines, direction, ticker) {
   const volumeCheck = {
     name: 'VOLUME',
     passed: !ticker || ticker.volume24h >= CONFIG.ENVIRONMENT.MIN_VOLUME_24H,
-    value: ticker?.volume24h || 0,
+    value: (ticker && ticker.volume24h) ? ticker.volume24h : 0,
     threshold: CONFIG.ENVIRONMENT.MIN_VOLUME_24H,
     severity: 'WARN'
   };
@@ -524,7 +524,7 @@ function environmentCheckV2(klines, direction, ticker) {
       rsi,
       atr: atrPercent,
       volatility,
-      volume24h: ticker?.volume24h || 0,
+      volume24h: (ticker && ticker.volume24h) ? ticker.volume24h : 0,
       currentPrice
     }
   };
@@ -653,7 +653,7 @@ function generateCandidateSignal(symbol, htfBias, ltfConfirm, envCheck, klines, 
   let stopLoss, tp1, tp2;
   
   const atr = calculateATR(klines, 14);
-  const relevantFVG = ltfConfirm.fvgList?.length > 0 ? ltfConfirm.fvgList[ltfConfirm.fvgList.length - 1] : null;
+  const relevantFVG = (ltfConfirm.fvgList && ltfConfirm.fvgList.length > 0) ? ltfConfirm.fvgList[ltfConfirm.fvgList.length - 1] : null;
   
   if (direction === 'LONG') {
     if (relevantFVG && relevantFVG.type === 'BULLISH_FVG') {
@@ -689,7 +689,7 @@ function generateCandidateSignal(symbol, htfBias, ltfConfirm, envCheck, klines, 
   if (htfBias.structureConfirmed) baseScore += 10;
   
   // LTF确认加分
-  const confirmedCount = ltfConfirm.confirmations?.filter(c => c.detected && c.aligned).length || 0;
+  const confirmedCount = (ltfConfirm.confirmations && ltfConfirm.confirmations.filter) ? ltfConfirm.confirmations.filter(c => c.detected && c.aligned).length : 0;
   baseScore += confirmedCount * 5;
   
   // 环境评分加权
@@ -724,9 +724,9 @@ function generateCandidateSignal(symbol, htfBias, ltfConfirm, envCheck, klines, 
   // 生成标签
   const tags = [];
   if (ltfConfirm.choch) tags.push('ChoCH');
-  if (ltfConfirm.fvgList?.length > 0) tags.push('FVG');
+  if (ltfConfirm.fvgList && ltfConfirm.fvgList.length > 0) tags.push('FVG');
   if (ltfConfirm.sweep) tags.push('Sweep');
-  if (ltfConfirm.obs?.length > 0) tags.push('OB');
+  if (ltfConfirm.obs && ltfConfirm.obs.length > 0) tags.push('OB');
   if (signalType === 'CANDIDATE') tags.push('候选');
   
   // 获取FVG价格水平
@@ -744,9 +744,9 @@ function generateCandidateSignal(symbol, htfBias, ltfConfirm, envCheck, klines, 
     }
   }
   
-  // 获取ChoCH和Sweep价格水平
-  const chochLevel = ltfConfirm.choch?.level || 0;
-  const sweepLevel = ltfConfirm.sweep?.sweptLevel || 0;
+  // 获取ChoCH和Sweep价格水平（兼容旧版Node.js）
+  const chochLevel = (ltfConfirm.choch && ltfConfirm.choch.level) ? ltfConfirm.choch.level : 0;
+  const sweepLevel = (ltfConfirm.sweep && ltfConfirm.sweep.sweptLevel) ? ltfConfirm.sweep.sweptLevel : 0;
   
   return {
     current_price: currentPrice,
@@ -760,7 +760,7 @@ function generateCandidateSignal(symbol, htfBias, ltfConfirm, envCheck, klines, 
     rsi: htfBias.rsi,
     tags,
     has_choch: !!ltfConfirm.choch,
-    has_fvg: ltfConfirm.fvgList?.length > 0,
+    has_fvg: (ltfConfirm.fvgList && ltfConfirm.fvgList.length > 0),
     has_sweep: !!ltfConfirm.sweep,
     fvg_top: fvgTop,
     fvg_bottom: fvgBottom,
@@ -813,8 +813,8 @@ function generateCandidateSignal(symbol, htfBias, ltfConfirm, envCheck, klines, 
     structure: {
       choch: ltfConfirm.choch,
       sweep: ltfConfirm.sweep,
-      fvg: ltfConfirm.fvgList?.[ltfConfirm.fvgList.length - 1] || null,
-      order_blocks: ltfConfirm.obs?.slice(-2) || []
+      fvg: (ltfConfirm.fvgList && ltfConfirm.fvgList.length > 0) ? ltfConfirm.fvgList[ltfConfirm.fvgList.length - 1] : null,
+      order_blocks: (ltfConfirm.obs && ltfConfirm.obs.slice) ? ltfConfirm.obs.slice(-2) : []
     },
     
     // 时间戳
