@@ -1160,21 +1160,266 @@ app.listen(PORT, () => {
   performScan();
 });
 
-// 定时扫描（每4小时）
-cron.schedule('0 */4 * * *', () => {
-  logger.info('Scheduled scan triggered');
+// ==================== 定时任务 ====================
+
+// 1. 定时扫描 - 每15分钟自动刷新K线和价格数据
+cron.schedule('*/15 * * * *', async () => {
+  logger.info('Scheduled scan triggered (15min interval)');
+  
+  // 检查数据健康状态
+  updateDataHealth();
+  const health = getDataHealthInfo();
+  
+  if (health.status === 'DEAD') {
+    logger.warn('Data is DEAD, forcing refresh before scan', { age_ms: health.age_ms });
+    // 强制刷新K线和价格数据
+    try {
+      latestKlines = await withRetry(() => getAllKlines('4h', 100), { maxRetries: 3 });
+      lastKlineUpdateTime = Date.now();
+      latestTickers = await withRetry(() => getTickers(), { maxRetries: 3 });
+      logger.info('Data refreshed successfully before scan');
+    } catch (error) {
+      logger.error('Failed to refresh data before scan', { error: error.message });
+    }
+  }
+  
   performScan('scheduler');
 });
 
-// 定时更新信号状态（每分钟）
-cron.schedule('* * * * *', () => {
-  updateSignalStatuses();
+// 2. 定时更新K线和价格数据 - 每5分钟（保持数据新鲜）
+cron.schedule('*/5 * * * *', async () => {
+  logger.info('Refreshing klines and tickers (5min interval)');
+  try {
+    const [klines, tickers] = await Promise.all([
+      withRetry(() => getAllKlines('4h', 100), { maxRetries: 2 }),
+      withRetry(() => getTickers(), { maxRetries: 2 })
+    ]);
+    
+    latestKlines = klines;
+    lastKlineUpdateTime = Date.now();
+    latestTickers = tickers;
+    
+    logger.info('Klines and tickers refreshed', {
+      klinesCount: Object.keys(klines).length,
+      tickersCount: Object.keys(tickers).length
+    });
+  } catch (error) {
+    logger.error('Failed to refresh klines and tickers', { error: error.message });
+  }
 });
 
-// 定时清理幂等记录（每小时）
+// 3. 信号生命周期管理 - 每1分钟检查信号状态（对比实时价格判断是否触及止盈止损）
+cron.schedule('* * * * *', async () => {
+  await updateSignalStatusesWithRealtimePrices();
+});
+
+// 4. 数据健康监控 - 每1分钟检查，STALE/DEAD时告警
+cron.schedule('* * * * *', () => {
+  checkDataHealthAndAlert();
+});
+
+// 5. 定时清理幂等记录（每小时）
 cron.schedule('0 * * * *', () => {
   scanIdempotency.cleanup();
   logger.info('Idempotency records cleaned up');
 });
+
+// ==================== 信号生命周期管理 ====================
+
+// 使用实时价格更新信号状态
+async function updateSignalStatusesWithRealtimePrices() {
+  if (!latestSignals || latestSignals.length === 0) {
+    return;
+  }
+  
+  // 获取最新实时价格
+  let currentPrices = {};
+  try {
+    currentPrices = await withRetry(() => getTickers(), { maxRetries: 2 });
+  } catch (error) {
+    logger.error('Failed to get realtime prices for signal status update', { error: error.message });
+    return;
+  }
+  
+  let updatedCount = 0;
+  const now = Date.now();
+  
+  for (const signal of latestSignals) {
+    // 只检查ACTIVE或PENDING状态的信号
+    if (signal.status !== 'ACTIVE' && signal.status !== 'PENDING') {
+      continue;
+    }
+    
+    const symbol = signal.symbol;
+    const ticker = currentPrices[symbol];
+    
+    if (!ticker || !ticker.last) {
+      continue;
+    }
+    
+    const currentPrice = parseFloat(ticker.last);
+    const entryPrice = signal.entry_price;
+    const sl = signal.sl;
+    const tp1 = signal.tp1;
+    const tp2 = signal.tp2;
+    const direction = signal.direction;
+    
+    let newStatus = null;
+    let statusReason = null;
+    let pnl = 0;
+    
+    // 判断止盈止损
+    if (direction === 'LONG') {
+      // 做多：检查是否触及止损或止盈
+      if (currentPrice <= sl) {
+        newStatus = 'INVALIDATED';
+        statusReason = 'STOP_LOSS_HIT';
+        pnl = ((sl - entryPrice) / entryPrice * 100);
+      } else if (currentPrice >= tp2) {
+        newStatus = 'ENTERED';
+        statusReason = 'TAKE_PROFIT_2_HIT';
+        pnl = ((tp2 - entryPrice) / entryPrice * 100);
+      } else if (currentPrice >= tp1) {
+        newStatus = 'ENTERED';
+        statusReason = 'TAKE_PROFIT_1_HIT';
+        pnl = ((currentPrice - entryPrice) / entryPrice * 100);
+      }
+    } else {
+      // 做空：检查是否触及止损或止盈
+      if (currentPrice >= sl) {
+        newStatus = 'INVALIDATED';
+        statusReason = 'STOP_LOSS_HIT';
+        pnl = ((entryPrice - sl) / entryPrice * 100);
+      } else if (currentPrice <= tp2) {
+        newStatus = 'ENTERED';
+        statusReason = 'TAKE_PROFIT_2_HIT';
+        pnl = ((entryPrice - tp2) / entryPrice * 100);
+      } else if (currentPrice <= tp1) {
+        newStatus = 'ENTERED';
+        statusReason = 'TAKE_PROFIT_1_HIT';
+        pnl = ((entryPrice - currentPrice) / entryPrice * 100);
+      }
+    }
+    
+    // 检查是否过期（4小时后）
+    if (!newStatus && signal.timestamp) {
+      const signalTime = new Date(signal.timestamp).getTime();
+      const expiresAt = signalTime + 4 * 60 * 60 * 1000; // 4小时
+      
+      if (now > expiresAt) {
+        newStatus = 'EXPIRED';
+        statusReason = 'SIGNAL_EXPIRED';
+        pnl = direction === 'LONG' 
+          ? ((currentPrice - entryPrice) / entryPrice * 100)
+          : ((entryPrice - currentPrice) / entryPrice * 100);
+      }
+    }
+    
+    // 更新信号状态
+    if (newStatus) {
+      const oldStatus = signal.status;
+      signal.status = newStatus;
+      signal.status_desc = getStatusDescription(newStatus, statusReason);
+      signal.realized_pnl = pnl;
+      signal.exit_price = currentPrice;
+      signal.exit_time = new Date().toISOString();
+      signal.exit_reason = statusReason;
+      
+      updatedCount++;
+      
+      logger.info('Signal status updated', {
+        symbol,
+        oldStatus,
+        newStatus,
+        reason: statusReason,
+        pnl: pnl.toFixed(2) + '%',
+        entryPrice,
+        exitPrice: currentPrice
+      });
+    }
+  }
+  
+  if (updatedCount > 0) {
+    saveData();
+    logger.info('Signal statuses updated', { updatedCount });
+  }
+}
+
+// 获取状态描述
+function getStatusDescription(status, reason) {
+  const descriptions = {
+    'ENTERED': { 'TAKE_PROFIT_1_HIT': '止盈1达成', 'TAKE_PROFIT_2_HIT': '止盈2达成' },
+    'INVALIDATED': { 'STOP_LOSS_HIT': '止损触发' },
+    'EXPIRED': { 'SIGNAL_EXPIRED': '信号过期' }
+  };
+  return descriptions[status]?.[reason] || status;
+}
+
+// ==================== 数据健康监控 ====================
+
+// 数据健康状态告警
+let lastAlertTime = 0;
+const ALERT_COOLDOWN = 5 * 60 * 1000; // 5分钟告警冷却
+
+function checkDataHealthAndAlert() {
+  updateDataHealth();
+  const health = getDataHealthInfo();
+  const now = Date.now();
+  
+  // STALE告警
+  if (health.status === 'STALE') {
+    if (now - lastAlertTime > ALERT_COOLDOWN) {
+      logger.warn('DATA_HEALTH_ALERT: Data is STALE', {
+        age_ms: health.age_ms,
+        age_formatted: health.age_formatted,
+        last_update: health.last_update,
+        action: 'Attempting automatic refresh'
+      });
+      lastAlertTime = now;
+      
+      // 尝试自动刷新数据
+      refreshDataSilently();
+    }
+  }
+  
+  // DEAD告警
+  if (health.status === 'DEAD') {
+    if (now - lastAlertTime > ALERT_COOLDOWN) {
+      logger.error('DATA_HEALTH_ALERT: Data is DEAD', {
+        age_ms: health.age_ms,
+        age_formatted: health.age_formatted,
+        last_update: health.last_update,
+        action: 'Immediate refresh required'
+      });
+      lastAlertTime = now;
+      
+      // 强制刷新数据
+      refreshDataSilently();
+    }
+  }
+}
+
+// 静默刷新数据（不触发扫描）
+async function refreshDataSilently() {
+  try {
+    logger.info('Attempting silent data refresh');
+    
+    const [klines, tickers] = await Promise.all([
+      withRetry(() => getAllKlines('4h', 100), { maxRetries: 2 }),
+      withRetry(() => getTickers(), { maxRetries: 2 })
+    ]);
+    
+    latestKlines = klines;
+    lastKlineUpdateTime = Date.now();
+    latestTickers = tickers;
+    
+    logger.info('Silent data refresh successful', {
+      klinesCount: Object.keys(klines).length,
+      tickersCount: Object.keys(tickers).length
+    });
+  } catch (error) {
+    logger.error('Silent data refresh failed', { error: error.message });
+  }
+}
 
 module.exports = { app, performScan };
